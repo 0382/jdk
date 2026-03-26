@@ -5466,8 +5466,8 @@ void PhaseIdealLoop::build_and_optimize() {
     }
   }
 
-  // Transform early-exit array equality loops into OR-XOR reduction loops
-  // to enable auto-vectorization.
+  // Replace early-exit byte-array equality loops with a vectorizedMismatch
+  // stub call to enable SIMD comparison while preserving early-exit semantics.
   if (OptimizeArrayEquality && C->has_loops() && !C->major_progress()) {
     if (do_transform_array_equality_loops()) {
       C->set_major_progress();

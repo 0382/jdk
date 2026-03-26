@@ -1833,8 +1833,8 @@ public:
   bool match_fill_loop(IdealLoopTree* lpt, Node*& store, Node*& store_value,
                        Node*& shift, Node*& offset);
 
-  // Conversion of early-exit array equality loops to OR-XOR reduction loops
-  // enabling auto-vectorization.
+  // Replacement of early-exit byte-array equality loops with a call to
+  // StubRoutines::vectorizedMismatch() for SIMD-accelerated comparison.
   bool do_transform_array_equality_loops();
   bool transform_array_equality_loop(IdealLoopTree* lpt);
   bool match_array_equality_loop(IdealLoopTree* lpt,
