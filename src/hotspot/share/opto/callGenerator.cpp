@@ -324,6 +324,25 @@ class LateInlineCallGenerator : public DirectCallGenerator {
 
   virtual bool is_late_inline() const { return true; }
 
+  // Compute priority for optimization-driven incremental inlining.
+  // Priority = call_frequency / callee_bytecode_size / (1 + inline_depth).
+  // This estimates the optimization benefit per unit of code growth.
+  virtual double compute_priority() const override {
+    CallNode* cn = call_node();
+    double call_freq = 1.0;
+    if (cn != nullptr) {
+      float cnt = cn->cnt();
+      if (cnt >= 0.0f) {
+        call_freq = (double)cnt + 1.0;
+      }
+    }
+    int bytecode_size = method()->code_size_for_inlining();
+    double callee_size = (double)MAX2(1, bytecode_size);
+    int depth = (cn != nullptr && cn->jvms() != nullptr) ? cn->jvms()->depth() : 0;
+    double depth_penalty = 1.0 + depth;
+    return call_freq / callee_size / depth_penalty;
+  }
+
   // Convert the CallStaticJava into an inline
   virtual void do_late_inline();
 
@@ -461,6 +480,27 @@ class LateInlineVirtualCallGenerator : public VirtualCallGenerator {
   virtual bool is_late_inline() const { return true; }
 
   virtual bool is_virtual_late_inline() const { return true; }
+
+  // Compute priority for optimization-driven incremental inlining.
+  // For virtual calls the callee may not be resolved yet; use the declared
+  // method size (or resolved callee size if already available) as an estimate.
+  virtual double compute_priority() const override {
+    CallNode* cn = call_node();
+    double call_freq = (double)_prof_factor + 1.0;
+    if (cn != nullptr) {
+      float cnt = cn->cnt();
+      if (cnt >= 0.0f) {
+        call_freq = (double)cnt + 1.0;
+      }
+    }
+    // Use resolved callee size if available, otherwise use declared method size.
+    ciMethod* target = (_callee != nullptr) ? _callee : method();
+    int bytecode_size = target->code_size_for_inlining();
+    double callee_size = (double)MAX2(1, bytecode_size);
+    int depth = (cn != nullptr && cn->jvms() != nullptr) ? cn->jvms()->depth() : 0;
+    double depth_penalty = 1.0 + depth;
+    return call_freq / callee_size / depth_penalty;
+  }
 
   // Convert the CallDynamicJava into an inline
   virtual void do_late_inline();

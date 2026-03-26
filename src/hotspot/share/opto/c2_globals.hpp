@@ -785,6 +785,13 @@
   product(bool, IncrementalInlineForceCleanup, false, DIAGNOSTIC,           \
           "do cleanup after every iteration of incremental inlining")       \
                                                                             \
+  product(bool, UseOptimizationDrivenInlining, false, DIAGNOSTIC,          \
+          "Use optimization-driven incremental inline substitution: "       \
+          "sort late-inline candidates by estimated benefit and adapt "     \
+          "the inline size threshold based on ongoing optimisation "        \
+          "progress. Implements the prio-inliner algorithm from "           \
+          "Prokopec et al., CGO 2019.")                                     \
+                                                                            \
   product(intx, LiveNodeCountInliningCutoff, 40000,                         \
           "max number of live nodes in a method")                           \
           range(0, max_juint / 8)                                           \

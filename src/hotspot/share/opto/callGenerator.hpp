@@ -74,6 +74,14 @@ class CallGenerator : public ArenaObj {
   virtual bool      is_late_inline() const         { return false; }
   // same but for method handle calls
   virtual bool      is_mh_late_inline() const      { return false; }
+
+  // Compute priority for optimization-driven incremental inlining ordering.
+  // Higher values mean higher priority (processed first).
+  // The priority is proportional to call frequency and inversely proportional
+  // to callee bytecode size and inline depth.
+  // Based on: Prokopec et al., "An Optimization-Driven Incremental Inline
+  // Substitution Algorithm for Just-in-Time Compilers", CGO 2019.
+  virtual double    compute_priority() const       { return 0.0; }
   virtual bool      is_string_late_inline() const  { return false; }
   virtual bool      is_boxing_late_inline() const  { return false; }
   virtual bool      is_vector_reboxing_late_inline() const  { return false; }
