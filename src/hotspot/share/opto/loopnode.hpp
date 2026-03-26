@@ -1833,8 +1833,9 @@ public:
   bool match_fill_loop(IdealLoopTree* lpt, Node*& store, Node*& store_value,
                        Node*& shift, Node*& offset);
 
-  // Replacement of early-exit byte-array equality loops with a call to
-  // StubRoutines::vectorizedMismatch() for SIMD-accelerated comparison.
+  // Replacement of early-exit byte-array equality loops with an OR-XOR
+  // vector reduction that C2's SLP vectorizer lowers to vpxor+vpor+vptest
+  // (or equivalent) instructions inline – no stub call overhead.
   bool do_transform_array_equality_loops();
   bool transform_array_equality_loop(IdealLoopTree* lpt);
   bool match_array_equality_loop(IdealLoopTree* lpt,

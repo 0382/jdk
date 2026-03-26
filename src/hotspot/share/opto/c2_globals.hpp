@@ -266,14 +266,14 @@
           "print detailed information about fill conversion")               \
                                                                             \
   product(bool, OptimizeArrayEquality, true,                                \
-          "replace early-exit byte-array equality loops with a call to "    \
-          "the vectorizedMismatch stub (vpcmpeqb+vptest on x86), which "    \
-          "processes elements in SIMD chunks while preserving early-exit "  \
-          "semantics at vector granularity")                              \
-                                                                            \
+          "transform early-exit byte-array equality loops into an OR-XOR "  \
+          "vector reduction (acc |= a[i]^b[i]) that C2 SLP vectorizes "    \
+          "to inline vpxor+vpor+vptest instructions with no "               \
+          "stub-call overhead")                                             \
+                                                                             \
   develop(bool, TraceOptimizeArrayEquality, false,                          \
           "print detailed information about array equality loop "            \
-          "replacement by vectorizedMismatch stub call")                    \
+          "OR-XOR reduction transformation")                                \
                                                                             \
   develop(bool, OptoCoalesce, true,                                         \
           "Use Conservative Copy Coalescing in the Register Allocator")     \

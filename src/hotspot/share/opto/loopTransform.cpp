@@ -4135,7 +4135,8 @@ bool PhaseIdealLoop::intrinsify_fill(IdealLoopTree* lpt) {
 
 //------------------------------do_transform_array_equality_loops--------------
 // Iterate over all loops looking for early-exit array equality patterns and
-// replace them with a call to the vectorizedMismatch stub.
+// replace them with an OR-XOR reduction that C2's SLP vectorizer lowers to
+// inline vpxor+vpor+vptest (or equivalent) instructions in the JIT output.
 bool PhaseIdealLoop::do_transform_array_equality_loops() {
   bool changed = false;
   for (LoopTreeIterator iter(_ltree_root); !iter.done(); iter.next()) {
@@ -4267,28 +4268,36 @@ bool PhaseIdealLoop::match_array_equality_loop(
 }
 
 //------------------------------transform_array_equality_loop------------------
-// If the loop matches the early-exit array equality pattern, replace it
-// with a call to StubRoutines::vectorizedMismatch().
+// If the loop matches the early-exit byte-array equality pattern, transform
+// it into an OR-XOR vector reduction that C2 lowers directly to
+// vpxor + vpor + vptest (or equivalent) instructions inline:
 //
 //   Before:
 //     for (int i = start; i < limit; i++) {
-//       if (a[i] != b[i]) return false;  // early exit on mismatch
+//       if (a[i] != b[i]) return false;   // early exit on mismatch
 //     }
-//     return true;                        // normal exit: all equal
+//     return true;                         // normal exit: all equal
 //
 //   After:
-//     int idx = vectorizedMismatch(a+start, b+start, limit-start, 0/*T_BYTE*/);
-//     if (idx < 0) { <normal exit: all equal> }
-//     else         { <early exit:  mismatch>  }
+//     int acc = 0;
+//     for (int i = start; i < limit; i++) {
+//       acc |= (a[i] ^ b[i]);             // OR-XOR accumulation
+//     }
+//     if (acc != 0) { <early-exit path> }  // post-loop mismatch test
+//     <normal-exit path>
 //
-// The vectorizedMismatch stub processes the comparison in SIMD chunks
-// (e.g. vpcmpeqb + vptest on x86) and returns as soon as a chunk differs,
-// so early-exit semantics are preserved at vector granularity.
-// This avoids the performance regression that the previous OR-XOR reduction
-// approach had when the mismatch occurs near the beginning of the arrays.
+// The OR-XOR accumulation loop has no interior conditional exits, so
+// C2's SLP auto-vectorizer can vectorize it into:
+//   vpxor (per-chunk XOR) + vpor (accumulate) + vptest (final zero-test)
+// or, when the vector width is known at compile time, the backend may emit
+// the equivalent AVX2 / SSE4 sequence.
+//
+// This generates all comparison instructions inline in the JIT output –
+// no stub function call, no function-call overhead – while correctly
+// reporting a mismatch if any byte pair differs.
 bool PhaseIdealLoop::transform_array_equality_loop(IdealLoopTree* lpt) {
   // -----------------------------------------------------------------------
-  // Step 1 – match the basic pattern
+  // Step 1 – match the pattern
   // -----------------------------------------------------------------------
   IfNode*      early_exit_if;
   IfTrueNode*  early_exit_proj;
@@ -4301,81 +4310,12 @@ bool PhaseIdealLoop::transform_array_equality_loop(IdealLoopTree* lpt) {
     return false;
   }
 
-  // -----------------------------------------------------------------------
-  // Step 2 – check that the vectorizedMismatch stub is available
-  // -----------------------------------------------------------------------
-  if (!UseVectorizedMismatchIntrinsic || StubRoutines::vectorizedMismatch() == nullptr) {
-    return false;
-  }
-
   CountedLoopNode*    head = lpt->_head->as_CountedLoop();
   CountedLoopEndNode* cle  = head->loopexit();
 
-  // The loop exit (IfFalse of the CLE) is where the loop's normal path exits.
+  // The loop exit (IfFalse of the CLE) is where the all-equal path goes.
   IfFalseNode* loop_exit = cle->false_proj_or_null();
   if (loop_exit == nullptr) {
-    return false;
-  }
-
-  head->verify_strip_mined(1);
-
-  // -----------------------------------------------------------------------
-  // Step 3 – validate loads: must be byte array element loads
-  // -----------------------------------------------------------------------
-  if (load_a->as_Load()->value_basic_type() != T_BYTE ||
-      load_b->as_Load()->value_basic_type() != T_BYTE) {
-    return false;
-  }
-  if (load_a->adr_type()->isa_aryptr() == nullptr ||
-      load_b->adr_type()->isa_aryptr() == nullptr) {
-    return false;
-  }
-
-  // -----------------------------------------------------------------------
-  // Step 4 – decompose load addresses to extract base + header-offset const
-  //
-  // For a byte array element load a[iv], the address is typically:
-  //   AddP(base_a, AddP(base_a, ConvI2L(iv), header_offset))
-  // unpack_offsets() yields: [ConvI2L(iv), header_offset_const]
-  // -----------------------------------------------------------------------
-  auto decompose_byte_load_addr =
-      [&](Node* load, Node*& base_out, Node*& con_out) -> bool {
-    Node* addr = load->in(MemNode::Address);
-    if (!addr->is_AddP()) return false;
-    base_out = addr->as_AddP()->in(AddPNode::Base);
-    con_out  = nullptr;
-    Node* elements[4];
-    int count = addr->as_AddP()->unpack_offsets(elements, ARRAY_SIZE(elements));
-    if (count <= 0 || count > 4) return false;
-    bool found_iv = false;
-    for (int e = 0; e < count; e++) {
-      Node* n = elements[e];
-      if (n->is_Con()) {
-        if (con_out == nullptr) { con_out = n; }
-        else { return false; } // unexpected second constant
-      } else {
-        // Strip ConvI2L and range-check CastII wrappers to reach the IV phi.
-        Node* inner = n;
-        while (inner->Opcode() == Op_ConvI2L ||
-               (inner->is_CastII() && inner->as_CastII()->has_range_check())) {
-          inner = inner->in(1);
-        }
-        if (inner == head->phi()) {
-          found_iv = true;
-        } else {
-          return false; // unexpected non-constant, non-IV element
-        }
-      }
-    }
-    return found_iv;
-  };
-
-  Node* base_a = nullptr;
-  Node* con_a  = nullptr;
-  Node* base_b = nullptr;
-  Node* con_b  = nullptr;
-  if (!decompose_byte_load_addr(load_a, base_a, con_a) ||
-      !decompose_byte_load_addr(load_b, base_b, con_b)) {
     return false;
   }
 
@@ -4385,171 +4325,127 @@ bool PhaseIdealLoop::transform_array_equality_loop(IdealLoopTree* lpt) {
     lpt->dump_head();
   }
   if (TraceOptimizeArrayEquality) {
-    tty->print_cr("ArrayEqualityTransform: replacing loop with vectorizedMismatch call");
+    tty->print_cr("ArrayEqualityTransform: building OR-XOR vector reduction");
     lpt->dump_head();
   }
 #endif
 
   // -----------------------------------------------------------------------
-  // Step 5 – build start addresses for the vectorizedMismatch call
+  // Step 2 – build the OR-XOR reduction nodes inside the loop
   //
-  // For byte elements (size = 1), the start address of a[init_trip] is:
-  //   base_a + ConvI2L(init_trip) + header_offset_const
-  // -----------------------------------------------------------------------
-  Node* init = head->init_trip();
-#ifdef _LP64
-  Node* init_x = new ConvI2LNode(init);
-  _igvn.register_new_node_with_optimizer(init_x);
-#else
-  Node* init_x = init;
-#endif
-
-  Node* a_start = AddPNode::make_with_base(base_a, init_x);
-  _igvn.register_new_node_with_optimizer(a_start);
-  if (con_a != nullptr) {
-    a_start = AddPNode::make_with_base(base_a, a_start, con_a);
-    _igvn.register_new_node_with_optimizer(a_start);
-  }
-
-  Node* b_start = AddPNode::make_with_base(base_b, init_x);
-  _igvn.register_new_node_with_optimizer(b_start);
-  if (con_b != nullptr) {
-    b_start = AddPNode::make_with_base(base_b, b_start, con_b);
-    _igvn.register_new_node_with_optimizer(b_start);
-  }
-
-  // -----------------------------------------------------------------------
-  // Step 6 – compute element count: limit - init_trip
-  // -----------------------------------------------------------------------
-  Node* length = new SubINode(head->limit(), head->init_trip());
-  _igvn.register_new_node_with_optimizer(length);
-
-  // -----------------------------------------------------------------------
-  // Step 7 – get pre-loop control and memory
-  // -----------------------------------------------------------------------
-  Node* entry_ctrl = head->init_control(); // = head->in(LoopNode::EntryControl)
-
-  // For a read-only loop the memory does not change inside the loop.
-  // Walk through any loop-memory phi to get the pre-loop entry memory.
-  Node* entry_mem = load_a->in(MemNode::Memory);
-  while (entry_mem->is_Phi() && entry_mem->in(0) == head) {
-    entry_mem = entry_mem->in(LoopNode::EntryControl);
-  }
-
-  // -----------------------------------------------------------------------
-  // Step 8 – build the CallLeafNoFPNode for vectorizedMismatch
+  //   acc_phi = Phi(head, 0 /*init*/, or_node /*back-edge*/)
+  //   xor_node = XorI(load_a, load_b)
+  //   or_node  = OrI(acc_phi, xor_node)      ← the reduction
   //
-  // Signature: int vectorizedMismatch(void* a, void* b, int length, int log2scale)
-  //   Returns: -1 if all bytes equal, otherwise the index of the first mismatch.
+  // The loop body becomes straight-line (no interior branch), which allows
+  // the SLP auto-vectorizer to pack LoadB+XorI+OrI into
+  // LoadVector+XorV+OrV, producing vpxor+vpor per SIMD chunk.
   // -----------------------------------------------------------------------
-  const TypeFunc* call_type = OptoRuntime::vectorizedMismatch_Type();
-  CallLeafNode* call = new CallLeafNoFPNode(call_type,
-                                            StubRoutines::vectorizedMismatch(),
-                                            "vectorizedMismatch",
-                                            TypePtr::BOTTOM);
-  call->init_req(TypeFunc::Parms + 0, a_start);          // obja
-  call->init_req(TypeFunc::Parms + 1, b_start);          // objb
-  call->init_req(TypeFunc::Parms + 2, length);           // length in elements
-  call->init_req(TypeFunc::Parms + 3, _igvn.intcon(0));  // log2scale = 0 for T_BYTE
-  call->init_req(TypeFunc::Control,   entry_ctrl);
-  call->init_req(TypeFunc::I_O,       C->top());         // Does no I/O.
-  call->init_req(TypeFunc::Memory,    entry_mem);
-  call->init_req(TypeFunc::ReturnAdr, C->start()->proj_out_or_null(TypeFunc::ReturnAdr));
-  Node* frame = new ParmNode(C->start(), TypeFunc::FramePtr);
-  _igvn.register_new_node_with_optimizer(frame);
-  call->init_req(TypeFunc::FramePtr,  frame);
-  _igvn.register_new_node_with_optimizer(call);
+  Node* loop_ctrl = head;
 
-  Node* call_ctrl = new ProjNode(call, TypeFunc::Control);
-  _igvn.register_new_node_with_optimizer(call_ctrl);
-  Node* call_mem = new ProjNode(call, TypeFunc::Memory);
-  _igvn.register_new_node_with_optimizer(call_mem);
-
-  // Return value: -1 if all elements equal; >= 0 is the mismatch index.
-  Node* mismatch_idx = new ProjNode(call, TypeFunc::Parms);
-  _igvn.register_new_node_with_optimizer(mismatch_idx);
-
-  // -----------------------------------------------------------------------
-  // Step 9 – build the post-call branch:  equal vs. mismatch
-  //
-  //   mismatch_idx < 0  =>  arrays are equal   => original loop-exit path
-  //   mismatch_idx >= 0 =>  mismatch found      => original early-exit path
-  // -----------------------------------------------------------------------
-  Node* cmp_result = new CmpINode(mismatch_idx, _igvn.intcon(0));
-  _igvn.register_new_node_with_optimizer(cmp_result);
-  Node* bool_lt = new BoolNode(cmp_result, BoolTest::lt); // mismatch_idx < 0
-  _igvn.register_new_node_with_optimizer(bool_lt);
-
-  // Equality is the expected common case.
-  IfNode* if_eq = new IfNode(call_ctrl, bool_lt, PROB_MAX, COUNT_UNKNOWN);
-  _igvn.register_new_node_with_optimizer(if_eq);
-
-  // IfTrue (mismatch_idx < 0): no mismatch => arrays are equal
-  IfTrueNode* if_eq_true = new IfTrueNode(if_eq);
-  _igvn.register_new_node_with_optimizer(if_eq_true);
-
-  // IfFalse (mismatch_idx >= 0): mismatch found
-  IfFalseNode* if_eq_false = new IfFalseNode(if_eq);
-  _igvn.register_new_node_with_optimizer(if_eq_false);
-
-  // -----------------------------------------------------------------------
-  // Step 10 – handle strip-mined outer loop (if any)
-  // -----------------------------------------------------------------------
-  if (head->is_strip_mined()) {
-    Node* outer_sfpt = head->outer_safepoint();
-    Node* in = outer_sfpt->in(0);
-    Node* outer_out = head->outer_loop_exit();
-    replace_node_and_forward_ctrl(outer_out, in);
-    _igvn.replace_input_of(outer_sfpt, 0, C->top());
+  // acc_phi = Phi(head, 0, or_node)
+  // We fill the back-edge after creating or_node below.
+  PhiNode* acc_phi = new PhiNode(head, TypeInt::INT);
+  acc_phi->init_req(LoopNode::EntryControl, _igvn.intcon(0));
+  _igvn.register_new_node_with_optimizer(acc_phi);
+  set_ctrl(acc_phi, loop_ctrl);
+  IdealLoopTree* inner_loop = get_loop(loop_ctrl);
+  if (!inner_loop->_child) {
+    inner_loop->_body.push(acc_phi);
   }
 
+  // xor_node = XorI(load_a, load_b) – non-zero iff the two bytes differ.
+  Node* xor_node = new XorINode(load_a, load_b);
+  register_new_node(xor_node, loop_ctrl);
+
+  // or_node = OrI(acc_phi, xor_node) – reduction: tracks any differing byte.
+  Node* or_node = new OrINode(acc_phi, xor_node);
+  register_new_node(or_node, loop_ctrl);
+
+  // Close the reduction cycle.
+  _igvn.hash_delete(acc_phi);
+  acc_phi->set_req(LoopNode::LoopBackControl, or_node);
+  _igvn.hash_insert(acc_phi);
+
   // -----------------------------------------------------------------------
-  // Step 11 – redirect control flow and update memory/IV uses
+  // Step 3 – remove the interior early-exit IfNode
+  //
+  // The CLE's control was:  cle.in(0) = continue_proj
+  //                                      (IfFalse of early_exit_if)
+  // Change it to:           cle.in(0) = head
+  // This makes the loop body straight-line so SLP can vectorize it.
+  // -----------------------------------------------------------------------
+  _igvn.replace_input_of(cle, 0, loop_ctrl);
+
+  // -----------------------------------------------------------------------
+  // Step 4 – insert a post-loop mismatch check
+  //
+  //   if (acc_phi != 0)  →  mismatch found  →  original early-exit path
+  //   if (acc_phi == 0)  →  all equal        →  original loop-exit path
+  //
+  // This restores the original semantics: false is returned iff any byte
+  // pair differed, true otherwise.
+  // -----------------------------------------------------------------------
+  IdealLoopTree* outer_loop = get_loop(loop_exit);
+  uint           dd_exit    = dom_depth(loop_exit);
+
+  Node* cmp_acc = new CmpINode(acc_phi, _igvn.intcon(0));
+  register_new_node(cmp_acc, loop_exit);
+
+  Node* bool_ne = new BoolNode(cmp_acc, BoolTest::ne);
+  register_new_node(bool_ne, loop_exit);
+
+  // Equality is the expected common case → PROB_MIN for the mismatch branch.
+  IfNode* if_acc = new IfNode(loop_exit, bool_ne, PROB_MIN, COUNT_UNKNOWN);
+  _igvn.register_new_node_with_optimizer(if_acc);
+  set_idom(if_acc, loop_exit, dd_exit + 1);
+  set_loop(if_acc, outer_loop);
+
+  // IfTrue  → mismatch (replaces the original early-exit projection)
+  IfTrueNode* if_acc_true = new IfTrueNode(if_acc);
+  _igvn.register_new_node_with_optimizer(if_acc_true);
+  set_idom(if_acc_true, if_acc, dd_exit + 2);
+  set_loop(if_acc_true, outer_loop);
+
+  // IfFalse → all equal (replaces the original loop-exit projection)
+  IfFalseNode* if_acc_false = new IfFalseNode(if_acc);
+  _igvn.register_new_node_with_optimizer(if_acc_false);
+  set_idom(if_acc_false, if_acc, dd_exit + 2);
+  set_loop(if_acc_false, outer_loop);
+
+  // -----------------------------------------------------------------------
+  // Step 5 – redirect control flow
+  //
+  // (a) All users of the original early-exit projection → if_acc_true.
+  // (b) All users of the original loop-exit (except if_acc) → if_acc_false.
   // -----------------------------------------------------------------------
 
-  // Replace the original early-exit projection (mismatch path) with if_eq_false.
-  _igvn.replace_node(early_exit_proj, if_eq_false);
+  // (a)
+  _igvn.replace_node(early_exit_proj, if_acc_true);
 
-  // Replace the original loop-exit projection (equal path) with if_eq_true.
-  replace_node_and_forward_ctrl(loop_exit, if_eq_true);
-
-  // Redirect the loop's memory phi (if any) outside the loop to call_mem.
-  // Since the loop has no stores, memory is read-only and we chain the
-  // post-call memory to maintain correct alias ordering.
-  for (uint i = 0; i < lpt->_body.size(); i++) {
-    Node* n = lpt->_body.at(i);
-    if (n->is_Phi() && n->as_Phi()->type() == Type::MEMORY) {
-      // Replace each memory phi with call_mem for uses outside the loop.
-      for (SimpleDUIterator it(n); it.has_next(); it.next()) {
-        Node* use = it.get();
-        if (!lpt->_body.contains(use)) {
-          for (uint k = 0; k < use->req(); k++) {
-            if (use->in(k) == n) {
-              _igvn.replace_input_of(use, k, call_mem);
-            }
-          }
-        }
-      }
+  // (b) Collect first, then redirect (replacing in place mutates the chain).
+  Node_List loop_exit_users;
+  for (DUIterator_Fast jmax, j = loop_exit->fast_outs(jmax); j < jmax; j++) {
+    Node* use = loop_exit->fast_out(j);
+    if (use != if_acc) {
+      loop_exit_users.push(use);
     }
   }
-
-  // Any use of the IV increment outside the loop becomes the loop limit.
-  _igvn.replace_node(head->incr(), head->limit());
-
-  // -----------------------------------------------------------------------
-  // Step 12 – kill the loop body
-  // -----------------------------------------------------------------------
-  for (uint i = 0; i < lpt->_body.size(); i++) {
-    Node* n = lpt->_body.at(i);
-    _igvn.replace_node(n, C->top());
+  for (uint i = 0; i < loop_exit_users.size(); i++) {
+    Node* use = loop_exit_users.at(i);
+    for (uint k = 0; k < use->req(); k++) {
+      if (use->in(k) == loop_exit) {
+        _igvn.replace_input_of(use, k, if_acc_false);
+      }
+    }
   }
 
   C->set_major_progress();
 
 #ifndef PRODUCT
   if (TraceOptimizeArrayEquality) {
-    tty->print_cr("ArrayEqualityTransform: loop replaced by vectorizedMismatch call");
-    call->dump();
+    tty->print_cr("ArrayEqualityTransform: OR-XOR reduction complete; "
+                  "SLP will vectorize to vpxor+vpor+vptest");
   }
 #endif
 
