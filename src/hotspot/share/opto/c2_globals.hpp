@@ -265,6 +265,13 @@
   develop(bool, TraceOptimizeFill, false,                                   \
           "print detailed information about fill conversion")               \
                                                                             \
+  product(bool, OptimizeArrayEquality, true,                                \
+          "convert early-exit array equality loops into OR-XOR reduction "  \
+          "loops enabling auto-vectorization")                              \
+                                                                            \
+  develop(bool, TraceOptimizeArrayEquality, false,                          \
+          "print detailed information about array equality loop conversion") \
+                                                                            \
   develop(bool, OptoCoalesce, true,                                         \
           "Use Conservative Copy Coalescing in the Register Allocator")     \
                                                                             \

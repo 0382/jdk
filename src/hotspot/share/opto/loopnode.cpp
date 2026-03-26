@@ -5466,6 +5466,14 @@ void PhaseIdealLoop::build_and_optimize() {
     }
   }
 
+  // Transform early-exit array equality loops into OR-XOR reduction loops
+  // to enable auto-vectorization.
+  if (OptimizeArrayEquality && C->has_loops() && !C->major_progress()) {
+    if (do_transform_array_equality_loops()) {
+      C->set_major_progress();
+    }
+  }
+
   // Perform iteration-splitting on inner loops.  Split iterations to avoid
   // range checks or one-shot null checks.
 
