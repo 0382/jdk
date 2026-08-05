@@ -497,6 +497,12 @@ private:
                                                       // false: there can't be one
                                                       // true: we've enqueued one at some point so there may still be one
 
+  // Optimization-driven incremental inline substitution.
+  // Based on: Prokopec et al., "An Optimization-Driven Incremental Inline
+  // Substitution Algorithm for Just-in-Time Compilers", CGO 2019.
+  double                        _adaptive_inline_threshold_factor; // scale factor for inline size limits (1.0 = default)
+  uint                          _prev_cleanup_live_nodes;          // live node count before last inline cleanup
+
   // "MemLimit" directive was specified and the memory limit was hit during compilation
   bool                          _oom;
 
@@ -1175,9 +1181,21 @@ public:
   void mark_has_mh_late_inlines() { _has_mh_late_inlines = true; }
   bool has_mh_late_inlines() const { return _has_mh_late_inlines; }
 
+  // Adaptive inline threshold factor for optimization-driven incremental inlining.
+  double adaptive_inline_threshold_factor() const { return _adaptive_inline_threshold_factor; }
+  void   set_adaptive_inline_threshold_factor(double f) { _adaptive_inline_threshold_factor = f; }
+
   bool inline_incrementally_one();
   void inline_incrementally_cleanup(PhaseIterGVN& igvn);
   void inline_incrementally(PhaseIterGVN& igvn);
+  // Sort the late-inlines queue by priority (highest first) for optimization-driven
+  // incremental inlining. Implements the priority-queue aspect of the algorithm from
+  // Prokopec et al., CGO 2019.
+  void sort_late_inlines_by_priority();
+  // Adjust the adaptive inline threshold factor based on node-count change observed
+  // during the last inline cleanup. When optimization reduces the IR significantly,
+  // the threshold is relaxed; when node count stays high, it is tightened.
+  void adjust_adaptive_inline_threshold(uint nodes_before_cleanup);
   bool should_stress_inlining() { return StressIncrementalInlining && (random() % 2) == 0; }
   bool should_delay_inlining() { return AlwaysIncrementalInline || should_stress_inlining(); }
   void inline_string_calls(bool parse_time);

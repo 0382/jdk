@@ -181,6 +181,20 @@ bool InlineTree::should_inline(ciMethod* callee_method, ciMethod* caller_method,
       return false;
     }
   }
+
+  // Optimization-driven incremental inlining: scale the effective size limit
+  // using the adaptive threshold factor.  During the incremental phase the
+  // factor rises when IGVN eliminates many nodes (room for more inlining) and
+  // falls when the live-node count is near the budget ceiling.
+  // Prokopec et al., "An Optimization-Driven Incremental Inline Substitution
+  // Algorithm for Just-in-Time Compilers", CGO 2019.
+  if (UseOptimizationDrivenInlining && C->inlining_incrementally()) {
+    double factor = C->adaptive_inline_threshold_factor();
+    int scaled = (int)((double)max_inline_size * factor);
+    // Never drop below MaxTrivialSize so that trivial methods are always inlined.
+    max_inline_size = MAX2(scaled, (int)MaxTrivialSize);
+  }
+
   if (size > max_inline_size) {
     if (max_inline_size > default_max_inline_size) {
       set_msg("hot method too big");

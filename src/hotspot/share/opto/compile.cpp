@@ -722,6 +722,8 @@ Compile::Compile(ciEnv* ci_env, ciMethod* target, int osr_bci,
       _vector_reboxing_late_inlines(comp_arena(), 2, 0, nullptr),
       _late_inlines_pos(0),
       _has_mh_late_inlines(false),
+      _adaptive_inline_threshold_factor(1.0),
+      _prev_cleanup_live_nodes(0),
       _oom(false),
       _replay_inline_data(nullptr),
       _inline_printer(this),
@@ -2866,6 +2868,55 @@ void Compile::shuffle_late_inlines() {
   shuffle_array(*C, _late_inlines);
 }
 
+// Comparison function for priority-based sorting of late inlines.
+// Sorts in descending order: higher priority items come first.
+static int cmp_late_inline_priority(CallGenerator** a, CallGenerator** b) {
+  double pa = (*a)->compute_priority();
+  double pb = (*b)->compute_priority();
+  if (pa > pb) return -1;  // a has higher priority, sort first
+  if (pa < pb) return  1;  // b has higher priority, sort first
+  return 0;
+}
+
+// Sort _late_inlines by descending priority so the most beneficial inlining
+// candidates are processed first.  This implements the priority-queue aspect
+// of the optimization-driven incremental inline substitution algorithm
+// (Prokopec et al., CGO 2019).
+void Compile::sort_late_inlines_by_priority() {
+  if (_late_inlines.length() < 2) {
+    return;
+  }
+  _late_inlines.sort(cmp_late_inline_priority);
+}
+
+// Adjust the adaptive inline threshold factor based on the reduction in live
+// node count achieved by the last IGVN cleanup.  When optimization eliminates
+// many nodes the factor is relaxed, allowing larger callees to be inlined.
+// When the live-node count stays near the budget ceiling the factor is
+// tightened to favour only the most cost-effective inlining candidates.
+// This implements the adaptive-threshold aspect of the algorithm from
+// Prokopec et al., CGO 2019.
+void Compile::adjust_adaptive_inline_threshold(uint nodes_before_cleanup) {
+  uint nodes_after = live_nodes();
+  uint budget       = (uint)LiveNodeCountInliningCutoff;
+
+  if (nodes_before_cleanup > nodes_after) {
+    // Optimization made progress: raise the threshold a little, but cap at 2×.
+    double reduction_ratio = (double)(nodes_before_cleanup - nodes_after) /
+                             (double)MAX2(1u, nodes_before_cleanup);
+    _adaptive_inline_threshold_factor *= (1.0 + reduction_ratio * 0.5);
+    if (_adaptive_inline_threshold_factor > 2.0) {
+      _adaptive_inline_threshold_factor = 2.0;
+    }
+  } else if (nodes_after > budget * 8 / 10) {
+    // Close to the node budget: lower the threshold by 10 %, but floor at 0.5×.
+    _adaptive_inline_threshold_factor *= 0.9;
+    if (_adaptive_inline_threshold_factor < 0.5) {
+      _adaptive_inline_threshold_factor = 0.5;
+    }
+  }
+}
+
 // Perform incremental inlining until bound on number of live nodes is reached
 void Compile::inline_incrementally(PhaseIterGVN& igvn) {
   TracePhase tp(_t_incrInline);
@@ -2875,6 +2926,9 @@ void Compile::inline_incrementally(PhaseIterGVN& igvn) {
 
   if (StressIncrementalInlining) {
     shuffle_late_inlines();
+  } else if (UseOptimizationDrivenInlining) {
+    // Sort the initial queue by priority: process highest-benefit candidates first.
+    sort_late_inlines_by_priority();
   }
 
   while (_late_inlines.length() > 0) {
@@ -2913,12 +2967,27 @@ void Compile::inline_incrementally(PhaseIterGVN& igvn) {
       break; // no more progress
     }
 
+    // Re-sort the queue by priority before each round so that newly discovered
+    // candidates (inserted during do_late_inline) compete on equal terms.
+    if (UseOptimizationDrivenInlining && !StressIncrementalInlining) {
+      sort_late_inlines_by_priority();
+    }
+
+    // Snapshot live-node count before executing this round so that the cleanup
+    // phase can measure the optimisation benefit and adjust the adaptive threshold.
+    uint nodes_before_round = live_nodes();
+
     while (inline_incrementally_one()) {
       assert(!failing_internal() || failure_is_artificial(), "inconsistent");
     }
     if (failing())  return;
 
     inline_incrementally_cleanup(igvn);
+
+    // Adjust the adaptive inline size threshold based on optimisation progress.
+    if (UseOptimizationDrivenInlining) {
+      adjust_adaptive_inline_threshold(nodes_before_round);
+    }
 
     print_method(PHASE_INCREMENTAL_INLINE_STEP, 3);
 
