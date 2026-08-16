@@ -270,6 +270,16 @@
   develop(bool, TraceOptimizeFill, false,                                   \
           "print detailed information about fill conversion")               \
                                                                             \
+  product(bool, OptimizeArrayEquality, true,                                \
+          "transform early-exit byte-array equality loops into an OR-XOR "  \
+          "vector reduction (acc |= a[i]^b[i]) that C2 SLP vectorizes "    \
+          "to inline vpxor+vpor+vptest instructions with no "               \
+          "stub-call overhead")                                             \
+                                                                             \
+  develop(bool, TraceOptimizeArrayEquality, false,                          \
+          "print detailed information about array equality loop "            \
+          "OR-XOR reduction transformation")                                \
+                                                                            \
   develop(bool, OptoCoalesce, true,                                         \
           "Use Conservative Copy Coalescing in the Register Allocator")     \
                                                                             \

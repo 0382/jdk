@@ -1865,6 +1865,18 @@ public:
   bool match_fill_loop(IdealLoopTree* lpt, Node*& store, Node*& store_value,
                        Node*& shift, Node*& offset);
 
+  // Replacement of early-exit byte-array equality loops with an OR-XOR
+  // vector reduction that C2's SLP vectorizer lowers to vpxor+vpor+vptest
+  // (or equivalent) instructions inline – no stub call overhead.
+  bool do_transform_array_equality_loops();
+  bool transform_array_equality_loop(IdealLoopTree* lpt);
+  bool match_array_equality_loop(IdealLoopTree* lpt,
+                                 IfNode*& early_exit_if,
+                                 IfTrueNode*& early_exit_proj,
+                                 IfFalseNode*& continue_proj,
+                                 Node*& load_a,
+                                 Node*& load_b);
+
 private:
   // Helper functions
   Node *spinup( Node *iff, Node *new_false, Node *new_true, Node *region, Node *phi, small_cache *cache );

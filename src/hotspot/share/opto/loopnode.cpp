@@ -5546,6 +5546,14 @@ void PhaseIdealLoop::build_and_optimize() {
     }
   }
 
+  // Replace early-exit byte-array equality loops with an OR-XOR vector
+  // reduction so C2's SLP vectorizer generates inline vpxor+vptest code.
+  if (OptimizeArrayEquality && C->has_loops() && !C->major_progress()) {
+    if (do_transform_array_equality_loops()) {
+      C->set_major_progress();
+    }
+  }
+
   // Perform iteration-splitting on inner loops.  Split iterations to avoid
   // range checks or one-shot null checks.
 

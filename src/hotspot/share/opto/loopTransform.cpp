@@ -4215,3 +4215,322 @@ bool PhaseIdealLoop::intrinsify_fill(IdealLoopTree* lpt) {
 
   return true;
 }
+
+//------------------------------do_transform_array_equality_loops--------------
+// Iterate over all loops looking for early-exit array equality patterns and
+// replace them with an OR-XOR reduction that C2's SLP vectorizer lowers to
+// inline vpxor+vpor+vptest (or equivalent) instructions in the JIT output.
+bool PhaseIdealLoop::do_transform_array_equality_loops() {
+  bool changed = false;
+  for (LoopTreeIterator iter(_ltree_root); !iter.done(); iter.next()) {
+    IdealLoopTree* lpt = iter.current();
+    changed |= transform_array_equality_loop(lpt);
+  }
+  return changed;
+}
+
+//------------------------------match_array_equality_loop----------------------
+// Match the pattern of a counted loop whose body contains exactly one
+// conditional early exit that fires when two array elements differ:
+//
+//   for (int i = 0; i < len; i++) {
+//     if (a[i] != b[i]) { <early exit / return false> }
+//   }
+//   <normal exit / return true>
+//
+// Returns true when the pattern is found and sets the output parameters:
+//   early_exit_if   – the interior IfNode whose true-projection leaves the loop
+//   early_exit_proj – IfTrue projection of early_exit_if (exits the loop)
+//   continue_proj   – IfFalse projection of early_exit_if (leads to CLE)
+//   load_a / load_b – the two array Load nodes being compared
+bool PhaseIdealLoop::match_array_equality_loop(
+    IdealLoopTree* lpt,
+    IfNode*&       early_exit_if,
+    IfTrueNode*&   early_exit_proj,
+    IfFalseNode*&  continue_proj,
+    Node*&         load_a,
+    Node*&         load_b)
+{
+  early_exit_if   = nullptr;
+  early_exit_proj = nullptr;
+  continue_proj   = nullptr;
+  load_a          = nullptr;
+  load_b          = nullptr;
+
+  // Only transform innermost counted loops.
+  if (!lpt->is_innermost() || !lpt->is_counted()) {
+    return false;
+  }
+
+  CountedLoopNode* head = lpt->_head->as_CountedLoop();
+  if (!head->is_valid_counted_loop(T_INT) || !head->is_normal_loop()) {
+    return false;
+  }
+
+  // Restrict to unit-stride loops (stride == +1).
+  if (head->stride_con() != 1) {
+    return false;
+  }
+
+  // The CountedLoopEnd must exist.
+  CountedLoopEndNode* cle = head->loopexit();
+  if (cle == nullptr) {
+    return false;
+  }
+
+  // The CLE's control input must be an IfFalse node, meaning there is at
+  // least one interior If whose false projection dominates the CLE.
+  Node* cle_ctrl = cle->in(0);
+  if (!cle_ctrl->is_IfFalse()) {
+    return false;
+  }
+
+  // The IfFalse's parent must be a non-CLE IfNode inside the loop body.
+  Node* inner_if_node = cle_ctrl->in(0);
+  if (!inner_if_node->is_If() || inner_if_node->is_BaseCountedLoopEnd()) {
+    return false;
+  }
+  if (!lpt->_body.contains(inner_if_node)) {
+    return false;
+  }
+  IfNode* inner_if = inner_if_node->as_If();
+
+  // The IfTrue of the interior If must leave the loop (early exit).
+  IfTrueNode* if_true = inner_if->true_proj_or_null();
+  if (if_true == nullptr) {
+    return false;
+  }
+  if (lpt->_body.contains(if_true)) {
+    return false;  // stays inside loop – not an early exit
+  }
+
+  // The test must be BoolNode(ne) – equality mismatch check.
+  Node* test = inner_if->in(1);
+  if (!test->is_Bool()) {
+    return false;
+  }
+  BoolNode* bool_node = test->as_Bool();
+  if (bool_node->_test._test != BoolTest::ne) {
+    return false;
+  }
+
+  // The comparison must be an integer (CmpI) of two values.
+  Node* cmp = bool_node->in(1);
+  if (cmp == nullptr || cmp->Opcode() != Op_CmpI) {
+    return false;
+  }
+
+  // Both operands must be Load nodes that reside in the loop body.
+  Node* val1 = cmp->in(1);
+  Node* val2 = cmp->in(2);
+  if (!val1->is_Load() || !val2->is_Load()) {
+    return false;
+  }
+  if (!lpt->_body.contains(val1) || !lpt->_body.contains(val2)) {
+    return false;
+  }
+  if (val1 == val2) {
+    return false;  // comparing the same element to itself
+  }
+
+  // Verify that there are no stores or other side-effectful nodes in
+  // the loop body.  The loop must be a pure read loop.
+  for (uint i = 0; i < lpt->_body.size(); i++) {
+    Node* n = lpt->_body.at(i);
+    if (n->is_Store() || n->is_Call()) {
+      return false;
+    }
+  }
+
+  early_exit_if   = inner_if;
+  early_exit_proj = if_true;
+  continue_proj   = cle_ctrl->as_IfFalse();
+  load_a          = val1;
+  load_b          = val2;
+  return true;
+}
+
+//------------------------------transform_array_equality_loop------------------
+// If the loop matches the early-exit byte-array equality pattern, transform
+// it into an OR-XOR vector reduction that C2 lowers directly to
+// vpxor + vpor + vptest (or equivalent) instructions inline:
+//
+//   Before:
+//     for (int i = start; i < limit; i++) {
+//       if (a[i] != b[i]) return false;   // early exit on mismatch
+//     }
+//     return true;                         // normal exit: all equal
+//
+//   After:
+//     int acc = 0;
+//     for (int i = start; i < limit; i++) {
+//       acc |= (a[i] ^ b[i]);             // OR-XOR accumulation
+//     }
+//     if (acc != 0) { <early-exit path> }  // post-loop mismatch test
+//     <normal-exit path>
+//
+// The OR-XOR accumulation loop has no interior conditional exits, so
+// C2's SLP auto-vectorizer can vectorize it into:
+//   vpxor (per-chunk XOR) + vpor (accumulate) + vptest (final zero-test)
+// or, when the vector width is known at compile time, the backend may emit
+// the equivalent AVX2 / SSE4 sequence.
+//
+// This generates all comparison instructions inline in the JIT output –
+// no stub function call, no function-call overhead – while correctly
+// reporting a mismatch if any byte pair differs.
+bool PhaseIdealLoop::transform_array_equality_loop(IdealLoopTree* lpt) {
+  // -----------------------------------------------------------------------
+  // Step 1 – match the pattern
+  // -----------------------------------------------------------------------
+  IfNode*      early_exit_if;
+  IfTrueNode*  early_exit_proj;
+  IfFalseNode* continue_proj;
+  Node*        load_a;
+  Node*        load_b;
+
+  if (!match_array_equality_loop(lpt, early_exit_if, early_exit_proj,
+                                 continue_proj, load_a, load_b)) {
+    return false;
+  }
+
+  CountedLoopNode*    head = lpt->_head->as_CountedLoop();
+  CountedLoopEndNode* cle  = head->loopexit();
+
+  // The loop exit (IfFalse of the CLE) is where the all-equal path goes.
+  IfFalseNode* loop_exit = cle->false_proj_or_null();
+  if (loop_exit == nullptr) {
+    return false;
+  }
+
+#ifndef PRODUCT
+  if (TraceLoopOpts) {
+    tty->print("ArrayEquality ");
+    lpt->dump_head();
+  }
+  if (TraceOptimizeArrayEquality) {
+    tty->print_cr("ArrayEqualityTransform: building OR-XOR vector reduction");
+    lpt->dump_head();
+  }
+#endif
+
+  // -----------------------------------------------------------------------
+  // Step 2 – build the OR-XOR reduction nodes inside the loop
+  //
+  //   acc_phi = Phi(head, 0 /*init*/, or_node /*back-edge*/)
+  //   xor_node = XorI(load_a, load_b)
+  //   or_node  = OrI(acc_phi, xor_node)      ← the reduction
+  //
+  // The loop body becomes straight-line (no interior branch), which allows
+  // the SLP auto-vectorizer to pack LoadB+XorI+OrI into
+  // LoadVector+XorV+OrV, producing vpxor+vpor per SIMD chunk.
+  // -----------------------------------------------------------------------
+  Node* loop_ctrl = head;
+
+  // acc_phi = Phi(head, 0, or_node)
+  // We fill the back-edge after creating or_node below.
+  PhiNode* acc_phi = new PhiNode(head, TypeInt::INT);
+  acc_phi->init_req(LoopNode::EntryControl, _igvn.intcon(0));
+  _igvn.register_new_node_with_optimizer(acc_phi);
+  set_ctrl(acc_phi, loop_ctrl);
+  IdealLoopTree* inner_loop = get_loop(loop_ctrl);
+  if (!inner_loop->_child) {
+    inner_loop->_body.push(acc_phi);
+  }
+
+  // xor_node = XorI(load_a, load_b) – non-zero iff the two bytes differ.
+  Node* xor_node = new XorINode(load_a, load_b);
+  register_new_node(xor_node, loop_ctrl);
+
+  // or_node = OrI(acc_phi, xor_node) – reduction: tracks any differing byte.
+  Node* or_node = new OrINode(acc_phi, xor_node);
+  register_new_node(or_node, loop_ctrl);
+
+  // Close the reduction cycle.
+  _igvn.hash_delete(acc_phi);
+  acc_phi->set_req(LoopNode::LoopBackControl, or_node);
+  _igvn.hash_insert(acc_phi);
+
+  // -----------------------------------------------------------------------
+  // Step 3 – remove the interior early-exit IfNode
+  //
+  // The CLE's control was:  cle.in(0) = continue_proj
+  //                                      (IfFalse of early_exit_if)
+  // Change it to:           cle.in(0) = head
+  // This makes the loop body straight-line so SLP can vectorize it.
+  // -----------------------------------------------------------------------
+  _igvn.replace_input_of(cle, 0, loop_ctrl);
+
+  // -----------------------------------------------------------------------
+  // Step 4 – insert a post-loop mismatch check
+  //
+  //   if (acc_phi != 0)  →  mismatch found  →  original early-exit path
+  //   if (acc_phi == 0)  →  all equal        →  original loop-exit path
+  //
+  // This restores the original semantics: false is returned iff any byte
+  // pair differed, true otherwise.
+  // -----------------------------------------------------------------------
+  IdealLoopTree* outer_loop = get_loop(loop_exit);
+  uint           dd_exit    = dom_depth(loop_exit);
+
+  Node* cmp_acc = new CmpINode(acc_phi, _igvn.intcon(0));
+  register_new_node(cmp_acc, loop_exit);
+
+  Node* bool_ne = new BoolNode(cmp_acc, BoolTest::ne);
+  register_new_node(bool_ne, loop_exit);
+
+  // Equality is the expected common case → PROB_MIN for the mismatch branch.
+  IfNode* if_acc = new IfNode(loop_exit, bool_ne, PROB_MIN, COUNT_UNKNOWN);
+  _igvn.register_new_node_with_optimizer(if_acc);
+  set_idom(if_acc, loop_exit, dd_exit + 1);
+  set_loop(if_acc, outer_loop);
+
+  // IfTrue  → mismatch (replaces the original early-exit projection)
+  IfTrueNode* if_acc_true = new IfTrueNode(if_acc);
+  _igvn.register_new_node_with_optimizer(if_acc_true);
+  set_idom(if_acc_true, if_acc, dd_exit + 2);
+  set_loop(if_acc_true, outer_loop);
+
+  // IfFalse → all equal (replaces the original loop-exit projection)
+  IfFalseNode* if_acc_false = new IfFalseNode(if_acc);
+  _igvn.register_new_node_with_optimizer(if_acc_false);
+  set_idom(if_acc_false, if_acc, dd_exit + 2);
+  set_loop(if_acc_false, outer_loop);
+
+  // -----------------------------------------------------------------------
+  // Step 5 – redirect control flow
+  //
+  // (a) All users of the original early-exit projection → if_acc_true.
+  // (b) All users of the original loop-exit (except if_acc) → if_acc_false.
+  // -----------------------------------------------------------------------
+
+  // (a)
+  _igvn.replace_node(early_exit_proj, if_acc_true);
+
+  // (b) Collect first, then redirect (replacing in place mutates the chain).
+  Node_List loop_exit_users;
+  for (DUIterator_Fast jmax, j = loop_exit->fast_outs(jmax); j < jmax; j++) {
+    Node* use = loop_exit->fast_out(j);
+    if (use != if_acc) {
+      loop_exit_users.push(use);
+    }
+  }
+  for (uint i = 0; i < loop_exit_users.size(); i++) {
+    Node* use = loop_exit_users.at(i);
+    for (uint k = 0; k < use->req(); k++) {
+      if (use->in(k) == loop_exit) {
+        _igvn.replace_input_of(use, k, if_acc_false);
+      }
+    }
+  }
+
+  C->set_major_progress();
+
+#ifndef PRODUCT
+  if (TraceOptimizeArrayEquality) {
+    tty->print_cr("ArrayEqualityTransform: OR-XOR reduction complete; "
+                  "SLP will vectorize to vpxor+vpor+vptest");
+  }
+#endif
+
+  return true;
+}
