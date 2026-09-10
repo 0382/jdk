@@ -9330,10 +9330,11 @@ void MacroAssembler::char_array_compress(Register src, Register dst, Register le
     movdl(tmp1Reg, tmp5);
     vpbroadcastd(tmp1Reg, tmp1Reg, Assembler::AVX_256bit);   // store Unicode mask in tmp1Reg
 
-    andl(len, 0xffffffe0);
-    jccb(Assembler::zero, copy_32);
+    cmpl(len, 32);
+    jcc(Assembler::less, copy_32);
 
     // compress 32 chars per iter
+    andl(len, 0xffffffe0);
     lea(src, Address(src, len, Address::times_2));
     lea(dst, Address(dst, len, Address::times_1));
     negptr(len);
@@ -9350,12 +9351,13 @@ void MacroAssembler::char_array_compress(Register src, Register dst, Register le
     addptr(len, 32);
     jccb(Assembler::notZero, copy_64_loop);
 
-    // compress next vector of 16 chars (if any)
-    bind(copy_32);
     movl(len, result);
     andl(len, 0x1f);
-    testl(result, 0x00000010);     // check if there's a block of 16 chars to compress
-    jccb(Assembler::zero, copy_16);
+
+    // compress next vector of 16 chars (if any)
+    bind(copy_32);
+    cmpl(len, 16);
+    jccb(Assembler::less, copy_16);
 
     vmovdqu(tmp2Reg, Address(src, 0));
     vptest(tmp2Reg, tmp1Reg, Assembler::AVX_256bit);       // check for Unicode chars in vector
@@ -9369,8 +9371,8 @@ void MacroAssembler::char_array_compress(Register src, Register dst, Register le
 
     // compress next vector of 8 chars (if any)
     bind(copy_16);
-    testl(result, 0x00000008);     // check if there's a block of 8 chars to compress
-    jccb(Assembler::zero, copy_tail_avx);
+    cmpl(len, 8);
+    jccb(Assembler::less, copy_tail_avx);
 
     movdqu(tmp2Reg, Address(src, 0));
     vptest(tmp2Reg, tmp1Reg, Assembler::AVX_128bit);       // check for Unicode chars in vector
